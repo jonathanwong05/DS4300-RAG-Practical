@@ -6,6 +6,8 @@ import numpy as np
 from redis.commands.search.query import Query
 import os
 import fitz
+import time
+import psutil
 
 # Initialize Redis connection
 redis_client = redis.Redis(host="localhost", port=6380, db=0)
@@ -49,7 +51,11 @@ def get_embedding(text: str, model: str = "nomic-embed-text") -> list:
 
 # store the embedding in Redis
 def store_embedding(file: str, page: str, chunk: str, embedding: list):
-    key = f"{DOC_PREFIX}:{file}_page_{page}_chunk_{chunk}"
+    
+    max_length = 50
+    shortened_chunk = (chunk[:max_length] + '...') if len(chunk) > max_length else chunk
+
+    key = f"{DOC_PREFIX}:{file}_page_{page}_chunk_{shortened_chunk}"
     redis_client.hset(
         key,
         mapping={
@@ -61,7 +67,7 @@ def store_embedding(file: str, page: str, chunk: str, embedding: list):
             ).tobytes(),  # Store as byte array
         },
     )
-    print(f"Stored embedding for: {chunk}")
+    print(f"Stored embedding for: {shortened_chunk}")
 
 
 # extract the text from a PDF by page
@@ -88,15 +94,24 @@ def split_text_into_chunks(text, chunk_size=300, overlap=50):
 # Process all PDF files in a given directory
 def process_pdfs(data_dir):
 
+    total_files = 0
+    total_pages = 0
+    total_chunks = 0
+
     for file_name in os.listdir(data_dir):
         if file_name.endswith(".pdf"):
+            total_files += 1
+            file_start = time.time()
+
             pdf_path = os.path.join(data_dir, file_name)
             text_by_page = extract_text_from_pdf(pdf_path)
+            file_page_count = len(text_by_page)
+            file_chunk_count = 0
+
             for page_num, text in text_by_page:
                 chunks = split_text_into_chunks(text)
-                # print(f"  Chunks: {chunks}")
+                file_chunk_count += len(chunks)
                 for chunk_index, chunk in enumerate(chunks):
-                    # embedding = calculate_embedding(chunk)
                     embedding = get_embedding(chunk)
                     store_embedding(
                         file=file_name,
@@ -105,8 +120,14 @@ def process_pdfs(data_dir):
                         chunk=str(chunk),
                         embedding=embedding,
                     )
-            print(f" -----> Processed {file_name}")
+            file_end = time.time()
+            file_time = file_end - file_start
 
+            print(f" -----> Processed {file_name}: {file_page_count} pages, {file_chunk_count} chunks in {file_time:.2f} seconds")
+            total_pages += file_page_count
+            total_chunks += file_chunk_count
+
+    return total_files, total_pages, total_chunks
 
 def query_redis(query_text: str):
     q = (
@@ -117,21 +138,53 @@ def query_redis(query_text: str):
     )
     query_text = "Efficient search in vector databases"
     embedding = get_embedding(query_text)
+
+    query_start = time.time()
     res = redis_client.ft(INDEX_NAME).search(
         q, query_params={"vec": np.array(embedding, dtype=np.float32).tobytes()}
     )
-    # print(res.docs)
+    query_end = time.time()
+    query_time = query_end - query_start
 
+    print("\n" + "=" * 50)
+    print("QUERY SUMMARY")
+    print("=" * 50)
+    print(f"Query: {query_text}")
+    print(f"Query execution time: {query_time:.2f} seconds")
+    print("Results:")
     for doc in res.docs:
-        print(f"{doc.id} \n ----> {doc.vector_distance}\n")
+        print(f"Document ID: {doc.id} | Similarity: {doc.vector_distance}")
+    print("=" * 50 + "\n")
 
 
 def main():
     clear_redis_store()
     create_hnsw_index()
 
-    process_pdfs("../data/")
+    # Log memory before ingestion
+    process_obj = psutil.Process(os.getpid())
+    mem_before = process_obj.memory_info().rss / (1024 * 1024)
+
+    ingestion_start = time.time()
+    total_files, total_pages, total_chunks = process_pdfs("../data/")
     print("\n---Done processing PDFs---\n")
+    ingestion_end = time.time()
+    ingestion_time = ingestion_end - ingestion_start
+
+    # Log memory after ingestion
+    mem_after = process_obj.memory_info().rss / (1024 * 1024)
+
+    print("\n" + "=" * 50)
+    print("INGESTION SUMMARY")
+    print("=" * 50)
+    print(f"Total files processed  : {total_files}")
+    print(f"Total pages processed  : {total_pages}")
+    print(f"Total chunks generated : {total_chunks}")
+    print(f"Total ingestion time   : {ingestion_time:.2f} seconds")
+    print(f"Memory usage before    : {mem_before:.2f} MB")
+    print(f"Memory usage after     : {mem_after:.2f} MB")
+    print("=" * 50 + "\n")
+
     query_redis("What is the capital of France?")
 
 
