@@ -116,8 +116,8 @@ def process_pdfs(data_dir):
             file_chunk_count = 0
 
             for page_num, text in text_by_page:
-                cleaned_text = clean_text(text, remove_punctuation=True, remove_whitespace=False)
-                chunks = split_text_into_chunks(text)
+                cleaned_text = clean_text(text, remove_punctuation=False, remove_whitespace=False)
+                chunks = split_text_into_chunks(cleaned_text)
                 file_chunk_count += len(chunks)
                 for chunk_index, chunk in enumerate(chunks):
                     embedding = get_embedding(chunk)
