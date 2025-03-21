@@ -7,11 +7,13 @@ import fitz
 import time
 import psutil
 import re
+from sentence_transformers import SentenceTransformer
 
 # Initialize Redis connection
 redis_client = redis.Redis(host="localhost", port=6380, db=0)
 
-VECTOR_DIM = 768
+#VECTOR_DIM = 768
+VECTOR_DIM = 384
 INDEX_NAME = "embedding_index"
 DOC_PREFIX = "doc:"
 DISTANCE_METRIC = "COSINE"
@@ -55,6 +57,18 @@ def get_embedding(text: str, model: str = "nomic-embed-text") -> list:
     response = ollama.embeddings(model=model, prompt=text)
     return response["embedding"]
 
+st_model_minilm = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+st_model_mpnet = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+
+# Generate an embedding for the given text using the MiniLM model
+def get_embedding_st_minilm(text: str) -> list:
+    embedding = st_model_minilm.encode(text)
+    return embedding.tolist()
+
+# Generate an embedding for the given text using the MPNet model
+def get_embedding_st_mpnet(text: str) -> list:
+    embedding = st_model_mpnet.encode(text)
+    return embedding.tolist()
 
 # store the embedding in Redis
 def store_embedding(file: str, page: str, chunk: str, embedding: list):
@@ -120,7 +134,9 @@ def process_pdfs(data_dir):
                 chunks = split_text_into_chunks(cleaned_text)
                 file_chunk_count += len(chunks)
                 for chunk_index, chunk in enumerate(chunks):
-                    embedding = get_embedding(chunk)
+                    #embedding = get_embedding(chunk)
+                    embedding = get_embedding_st_minilm(chunk)
+                    #embedding = get_embedding_st_mpnet(chunk)
                     store_embedding(
                         file=file_name,
                         page=str(page_num),
@@ -145,7 +161,9 @@ def query_redis(query_text: str):
         .dialect(2)
     )
     query_text = "Efficient search in vector databases"
-    embedding = get_embedding(query_text)
+    #embedding = get_embedding(query_text)
+    embedding = get_embedding_st_minilm(query_text)
+    #embedding = get_embedding_st_mpnet(query_text)
 
     query_start = time.time()
     res = redis_client.ft(INDEX_NAME).search(

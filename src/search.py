@@ -5,10 +5,11 @@ from sentence_transformers import SentenceTransformer
 import ollama
 from redis.commands.search.query import Query
 from redis.commands.search.field import VectorField, TextField
+from ingest import get_embedding, get_embedding_st_minilm, get_embedding_st_mpnet
 
 
-# Initialize models
-# embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+
 redis_client = redis.StrictRedis(host="localhost", port=6380, decode_responses=True)
 
 VECTOR_DIM = 768
@@ -16,20 +17,12 @@ INDEX_NAME = "embedding_index"
 DOC_PREFIX = "doc:"
 DISTANCE_METRIC = "COSINE"
 
-# def cosine_similarity(vec1, vec2):
-#     """Calculate cosine similarity between two vectors."""
-#     return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
-
-
-def get_embedding(text: str, model: str = "nomic-embed-text") -> list:
-
-    response = ollama.embeddings(model=model, prompt=text)
-    return response["embedding"]
-
 
 def search_embeddings(query, top_k=3):
 
-    query_embedding = get_embedding(query)
+    #query_embedding = get_embedding(query)
+    query_embedding = get_embedding_st_minilm(query)
+    #query_embedding = get_embedding_st_mpnet(query)
 
     # Convert embedding to bytes for Redis search
     query_vector = np.array(query_embedding, dtype=np.float32).tobytes()
