@@ -82,9 +82,36 @@ def generate_rag_response(query, context_results):
     print(f"context_str: {context_str}")
 
     # Construct prompt with context
-    prompt = f"""You are a helpful AI assistant. 
-    Use the following context to answer the query as accurately as possible. If the context is 
-    not relevant to the query, say 'I don't know'.
+    
+    # Original Option
+#     prompt = f"""You are a helpful AI assistant. 
+#     Use the following context to answer the query as accurately as possible. If the context is 
+#     not relevant to the query, say 'I don't know'.
+    
+
+# Context:
+# {context_str}
+
+# Query: {query}
+
+# Answer:"""
+
+    # Option 2
+#     prompt = f"""You are an expert data science assistant. Use the context below to provide a 
+#     clear and concise answer to the query. If the context is irrelevant,
+#     respond with 'I don't know'.
+
+# Context:
+# {context_str}
+
+# Query: {query}
+
+# Answer:"""
+
+    # Option 3
+    prompt = f"""You are a knowledgeable AI assistant with expertise in DS4300 course content.
+    Carefully analyze the following context and craft a detailed, accurate answer to the query.
+    If the context is not relevant to the query, say 'I don't know'.
 
 Context:
 {context_str}
