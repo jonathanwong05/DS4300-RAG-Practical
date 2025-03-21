@@ -1,5 +1,3 @@
-## DS 4300 Example - from docs
-
 import ollama
 import redis
 import numpy as np
@@ -8,6 +6,7 @@ import os
 import fitz
 import time
 import psutil
+import re
 
 # Initialize Redis connection
 redis_client = redis.Redis(host="localhost", port=6380, db=0)
@@ -17,6 +16,14 @@ INDEX_NAME = "embedding_index"
 DOC_PREFIX = "doc:"
 DISTANCE_METRIC = "COSINE"
 
+
+# Preprocessing function
+def clean_text(text, remove_punctuation=False, remove_whitespace=False):
+    if remove_punctuation:
+        text = re.sub(r'[^\w\s]', '', text)
+    if remove_whitespace:
+        text = ' '.join(text.split())
+    return text
 
 # used to clear the redis vector store
 def clear_redis_store():
@@ -109,6 +116,7 @@ def process_pdfs(data_dir):
             file_chunk_count = 0
 
             for page_num, text in text_by_page:
+                cleaned_text = clean_text(text, remove_punctuation=True, remove_whitespace=False)
                 chunks = split_text_into_chunks(text)
                 file_chunk_count += len(chunks)
                 for chunk_index, chunk in enumerate(chunks):
@@ -146,6 +154,7 @@ def query_redis(query_text: str):
     query_end = time.time()
     query_time = query_end - query_start
 
+    similarities = []
     print("\n" + "=" * 50)
     print("QUERY SUMMARY")
     print("=" * 50)
