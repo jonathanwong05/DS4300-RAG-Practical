@@ -82,7 +82,7 @@ def generate_rag_response(query, context_results):
     print(f"context_str: {context_str}")
 
     # Construct prompt with context
-    
+
     # Original Option
 #     prompt = f"""You are a helpful AI assistant. 
 #     Use the following context to answer the query as accurately as possible. If the context is 
@@ -121,8 +121,20 @@ Query: {query}
 Answer:"""
 
     # Generate response using Ollama
+
+    # # mistral:latest version
+    # response = ollama.chat(
+    #     model="mistral:latest", messages=[{"role": "user", "content": prompt}]
+    # )
+
+    # # llama7b version
+    # response = ollama.chat(
+    #     model="llama2:7b", messages=[{"role": "user", "content": prompt}]
+    # )
+
+    # vicuna7b version
     response = ollama.chat(
-        model="mistral:latest", messages=[{"role": "user", "content": prompt}]
+        model="vicuna:7b", messages=[{"role": "user", "content": prompt}]
     )
 
     return response["message"]["content"]
@@ -147,28 +159,6 @@ def interactive_search():
 
         print("\n--- Response ---")
         print(response)
-
-
-# def store_embedding(file, page, chunk, embedding):
-#     """
-#     Store an embedding in Redis using a hash with vector field.
-
-#     Args:
-#         file (str): Source file name
-#         page (str): Page number
-#         chunk (str): Chunk index
-#         embedding (list): Embedding vector
-#     """
-#     key = f"{file}_page_{page}_chunk_{chunk}"
-#     redis_client.hset(
-#         key,
-#         mapping={
-#             "embedding": np.array(embedding, dtype=np.float32).tobytes(),
-#             "file": file,
-#             "page": page,
-#             "chunk": chunk,
-#         },
-#     )
 
 
 if __name__ == "__main__":
