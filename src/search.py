@@ -10,7 +10,7 @@ from ingest import get_embedding, get_embedding_st_minilm, get_embedding_st_mpne
 
 
 
-redis_client = redis.StrictRedis(host="localhost", port=6380, decode_responses=True)
+redis_client = redis.StrictRedis(host="localhost", port=6379, decode_responses=True)
 
 VECTOR_DIM = 768
 INDEX_NAME = "embedding_index"
