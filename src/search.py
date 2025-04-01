@@ -1,5 +1,4 @@
 import redis
-import json
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import ollama

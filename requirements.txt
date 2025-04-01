@@ -1,0 +1,10 @@
+numpy
+psutil
+PyMuPDF
+redis
+sentence-transformers
+ollama
+fitz
+os
+time
+re
