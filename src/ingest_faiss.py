@@ -1,98 +1,125 @@
 import os
-import time
 import fitz  # PyMuPDF
-import re
 import numpy as np
 import faiss
+import pickle
 from sentence_transformers import SentenceTransformer
-
-# Initialize the embedding model
-embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-# Faiss index setup (384 is the dimensionality of the 'all-MiniLM-L6-v2' embeddings)
-embedding_dim = 384
-index = faiss.IndexFlatL2(embedding_dim)
-
-# Metadata storage (to be used in the search function)
-metadata = []
+import time
+import psutil
+import re
 
 
-# Preprocessing function
-def clean_text(text, remove_punctuation=False, remove_whitespace=False):
-    if remove_punctuation:
-        text = re.sub(r'[^\w\s]', '', text)
-    if remove_whitespace:
-        text = ' '.join(text.split())
-    return text
+class FAISSIngestor:
+    def __init__(self, data_dir="../data/"):
+        self.data_dir = data_dir
+        self.embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        self.index = None
+        self.metadata = []
+        self.embedding_dim = 384  # Match MiniLM-L6 dimension
 
+    def clean_text(self, text):
+        """Basic text cleaning"""
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
-# Extract text from a PDF by page
-def extract_text_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    text_by_page = []
-    for page_num, page in enumerate(doc):
-        text_by_page.append((page_num, page.get_text()))
-    return text_by_page
+    def extract_text_from_pdf(self, pdf_path):
+        """Extract text with page numbers"""
+        doc = fitz.open(pdf_path)
+        text_by_page = []
+        for page_num, page in enumerate(doc):
+            text = page.get_text()
+            if text.strip():
+                text_by_page.append((page_num, text))
+        return text_by_page
 
+    def split_text_into_chunks(self, text, chunk_size=500, overlap=150):
+        """Split text into overlapping chunks"""
+        words = text.split()
+        chunks = []
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = " ".join(words[i: i + chunk_size])
+            chunks.append(chunk)
+        return chunks
 
-# Split text into chunks with overlap
-def split_text_into_chunks(text, chunk_size=500, overlap=150):
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i: i + chunk_size])
-        chunks.append(chunk)
-    return chunks
+    def create_faiss_index(self):
+        """Initialize FAISS index"""
+        self.index = faiss.IndexFlatIP(self.embedding_dim)  # Using Inner Product for cosine similarity
 
+    def process_pdfs(self):
+        """Main processing pipeline"""
+        total_files = 0
+        total_pages = 0
+        total_chunks = 0
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / (1024 * 1024)
+        start_time = time.time()
 
-# Store embedding in Faiss and metadata
-def store_embedding(file, page, chunk, embedding):
-    # Convert embedding to float32 and normalize it
-    embedding = np.array(embedding, dtype=np.float32).reshape(1, -1)
-    faiss.normalize_L2(embedding)  # Normalize the embedding
+        self.create_faiss_index()
+        all_embeddings = []
 
-    # Add embedding to Faiss index
-    index.add(embedding)
+        for file_name in os.listdir(self.data_dir):
+            if file_name.endswith(".pdf"):
+                total_files += 1
+                file_start = time.time()
+                pdf_path = os.path.join(self.data_dir, file_name)
 
-    # Store metadata
-    metadata.append({"file": file, "page": page, "chunk": chunk})
+                try:
+                    text_by_page = self.extract_text_from_pdf(pdf_path)
+                    for page_num, text in text_by_page:
+                        cleaned_text = self.clean_text(text)
+                        chunks = self.split_text_into_chunks(cleaned_text)
 
-    print(f"Stored embedding for: {file}, Page {page}")
+                        if chunks:
+                            # Batch encode chunks
+                            chunk_embeddings = self.embedding_model.encode(chunks)
 
+                            # Store metadata for each chunk
+                            for i, chunk in enumerate(chunks):
+                                self.metadata.append({
+                                    "file": file_name,
+                                    "page": page_num,
+                                    "chunk": chunk,
+                                    "chunk_idx": i
+                                })
 
-# Process all PDFs in a directory
-def process_pdfs(data_dir):
-    total_files = 0
-    total_pages = 0
-    total_chunks = 0
+                            all_embeddings.append(chunk_embeddings)
+                            total_chunks += len(chunks)
 
-    for file_name in os.listdir(data_dir):
-        if file_name.endswith(".pdf"):
-            total_files += 1
-            file_start = time.time()
+                    total_pages += len(text_by_page)
+                    print(f"Processed {file_name} ({len(text_by_page)} pages, {len(chunks)} chunks)")
 
-            pdf_path = os.path.join(data_dir, file_name)
-            text_by_page = extract_text_from_pdf(pdf_path)
-            file_page_count = len(text_by_page)
-            file_chunk_count = 0
+                except Exception as e:
+                    print(f"Error processing {file_name}: {str(e)}")
 
-            for page_num, text in text_by_page:
-                cleaned_text = clean_text(text, remove_punctuation=False, remove_whitespace=False)
-                chunks = split_text_into_chunks(cleaned_text)
-                file_chunk_count += len(chunks)
-                for chunk in chunks:
-                    embedding = embedding_model.encode(chunk)
-                    store_embedding(file_name, page_num, chunk, embedding)
+        # Combine all embeddings and add to index
+        if all_embeddings:
+            all_embeddings = np.vstack(all_embeddings).astype('float32')
 
-            file_end = time.time()
-            print(
-                f"Processed {file_name}: {file_page_count} pages, {file_chunk_count} chunks in {file_end - file_start:.2f} seconds")
-            total_pages += file_page_count
-            total_chunks += file_chunk_count
+            # Normalize embeddings before adding to index
+            faiss.normalize_L2(all_embeddings)
+            self.index.add(all_embeddings)
 
-    print(f"\nProcessed {total_files} files, {total_pages} pages, {total_chunks} chunks.")
+            # Save index and metadata
+            faiss.write_index(self.index, "faiss_index.index")
+            with open("faiss_metadata.pkl", "wb") as f:
+                pickle.dump(self.metadata, f)
+
+        mem_after = process.memory_info().rss / (1024 * 1024)
+        total_time = time.time() - start_time
+
+        print("\n" + "=" * 50)
+        print("INGESTION SUMMARY")
+        print("=" * 50)
+        print(f"Total files processed: {total_files}")
+        print(f"Total pages processed: {total_pages}")
+        print(f"Total chunks generated: {total_chunks}")
+        print(f"Total ingestion time: {total_time:.2f} seconds")
+        print(f"Memory usage before: {mem_before:.2f} MB")
+        print(f"Memory usage after: {mem_after:.2f} MB")
+        print(f"FAISS index size: {self.index.ntotal if self.index else 0} vectors")
+        print("=" * 50)
 
 
 if __name__ == "__main__":
-    data_dir = "../data/"  # Update to your actual data directory
-    process_pdfs(data_dir)
+    ingestor = FAISSIngestor()
+    ingestor.process_pdfs()

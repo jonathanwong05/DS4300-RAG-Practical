@@ -1,35 +1,125 @@
-from chromadb import PersistentClient
+import chromadb
 from sentence_transformers import SentenceTransformer
+import ollama
+from typing import List, Dict, Any
 
-db_path = "./chroma_db"
-collection_name = "pdf_embeddings"  # Ensure this matches the collection name used in ingestion
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-def search(query, top_k=3):
-    client = PersistentClient(path=db_path)
-    collection = client.get_collection(name=collection_name)
+class ChromaDBSearcher:
+    def __init__(self, db_path="./chroma_db"):
+        self.client = chromadb.PersistentClient(path=db_path)
+        try:
+            self.collection = self.client.get_collection("pdf_embeddings")
+        except ValueError:
+            raise Exception("Collection not found. Please run ingestion first.")
+        self.embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        self.ensure_ollama_model()
 
-    query_embedding = model.encode([query]).tolist()[0]
-    results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+    def ensure_ollama_model(self):
+        """Check if Mistral model is available, pull if needed"""
+        try:
+            ollama.show("mistral")
+        except Exception:
+            print("Mistral model not found. Pulling it now...")
+            ollama.pull("mistral")
+            print("Mistral model ready!")
 
-    if not results["metadatas"]:
-        print("No matching documents found.")
-        return
+    def search_embeddings(self, query: str, top_k: int = 3) -> Dict[str, Any]:
+        query_embedding = self.embedding_model.encode(query).tolist()
+        return self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            include=["metadatas", "distances", "documents"]
+        )
 
-    seen_files = set()  # Track files that have already been printed
+    def format_results(self, results: Dict[str, Any]) -> List[Dict[str, Any]]:
+        formatted = []
+        for metadata, document, distance in zip(
+                results['metadatas'][0],
+                results['documents'][0],
+                results['distances'][0]
+        ):
+            if document:
+                formatted.append({
+                    "file": metadata.get('file', 'Unknown'),
+                    "page": metadata.get('page', '0'),
+                    "content": document,
+                    "similarity": 1 - float(distance)
+                })
+        return formatted
 
-    for i, (metadata_list, distances) in enumerate(zip(results["metadatas"], results["distances"])):
-        distance = distances[0] if isinstance(distances, list) else distances
+    def generate_response(self, query: str, context: List[Dict[str, Any]]) -> str:
+        if not context:
+            return "I couldn't find any relevant information in the documents."
 
-        for metadata in metadata_list:
-            file_name = metadata.get("file", "No file provided")
-            if file_name not in seen_files:  # Check if file is already printed
-                seen_files.add(file_name)
-                chunk_text = metadata.get("chunk", "No chunk text available")
-                similarity = round(1 - distance, 4)  # Convert distance to similarity
+        context_str = "\n\n".join(
+            f"From {res['file']} (Page {res['page']}):\n"
+            f"{res['content']}\n"
+            for res in context
+        )
 
-                print(f"{i+1}. File: {file_name} (Similarity: {similarity})\n   Snippet: {chunk_text[:300]}...\n")
+        prompt = f"""You are a technical assistant. Answer the question using only the provided context.
+If the answer isn't in the context, say you don't know.
+
+Context:
+{context_str}
+
+Question: {query}
+
+Answer in detail, focusing on the technical aspects:"""
+
+        try:
+            response = ollama.chat(
+                model="mistral",
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.3}  # More focused responses
+            )
+            return response['message']['content']
+        except Exception as e:
+            return f"Error: Could not generate response. Please try again later.\n{str(e)}"
+
+    def interactive_search(self):
+        print("🔍 ChromaDB RAG Search Interface")
+        print("Type 'exit' to quit\n")
+
+        while True:
+            query = input("\nEnter your search query: ").strip()
+            if query.lower() in ('exit', 'quit'):
+                break
+
+            try:
+                print("\nSearching...")
+                raw_results = self.search_embeddings(query)
+                results = self.format_results(raw_results)
+
+                if not results:
+                    print("\nNo relevant documents found.")
+                    continue
+
+                print("\nTop matches:")
+                for i, res in enumerate(results, 1):
+                    preview = res['content'][:200].replace('\n', ' ')
+                    print(f"{i}. {res['file']} (Page {res['page']}, Similarity: {res['similarity']:.3f})")
+                    print(f"   {preview}...\n")
+
+                print("Generating response...")
+                response = self.generate_response(query, results)
+                print("\n" + "=" * 50)
+                print("AI Response:")
+                print("=" * 50)
+                print(response)
+                print("=" * 50)
+
+            except Exception as e:
+                print(f"\nError: {str(e)}")
+
 
 if __name__ == "__main__":
-    query = input("Enter your search query: ")
-    search(query)
+    try:
+        searcher = ChromaDBSearcher()
+        searcher.interactive_search()
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        print("Possible solutions:")
+        print("1. Run ingest_chroma.py first to create the document collection")
+        print("2. Ensure Ollama is running (run 'ollama serve' in another terminal)")
+        print("3. Install required models with 'ollama pull mistral'")
