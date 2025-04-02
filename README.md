@@ -16,7 +16,7 @@
 
 1. **Ingest Data:**
    - Place your PDF course notes in the `data/` folder
-   - Run the ingestion script to extract, chunk, and index the data
+   - CD into the src directory in your terminal, then run the ingestion script to extract, chunk, and index the data
 
 2. **Search & Query:**
    - After ingestion, you can run the interactive search script to query the indexed data
