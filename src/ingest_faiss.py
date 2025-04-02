@@ -7,6 +7,7 @@ from sentence_transformers import SentenceTransformer
 import time
 import psutil
 import re
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 class FAISSIngestor:
@@ -15,15 +16,14 @@ class FAISSIngestor:
         self.embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
         self.index = None
         self.metadata = []
-        self.embedding_dim = 384  # Match MiniLM-L6 dimension
+        self.embedding_dim = 384
+        self.similarities = []
 
     def clean_text(self, text):
-        """Basic text cleaning"""
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
     def extract_text_from_pdf(self, pdf_path):
-        """Extract text with page numbers"""
         doc = fitz.open(pdf_path)
         text_by_page = []
         for page_num, page in enumerate(doc):
@@ -33,7 +33,6 @@ class FAISSIngestor:
         return text_by_page
 
     def split_text_into_chunks(self, text, chunk_size=500, overlap=150):
-        """Split text into overlapping chunks"""
         words = text.split()
         chunks = []
         for i in range(0, len(words), chunk_size - overlap):
@@ -41,12 +40,18 @@ class FAISSIngestor:
             chunks.append(chunk)
         return chunks
 
+    def calculate_similarity(self, embeddings):
+        """Calculate pairwise cosine similarities between chunks"""
+        if len(embeddings) < 2:
+            return []
+        sim_matrix = cosine_similarity(embeddings)
+        np.fill_diagonal(sim_matrix, 0)  # Ignore self-similarity
+        return sim_matrix.max(axis=1)  # Get max similarity for each chunk
+
     def create_faiss_index(self):
-        """Initialize FAISS index"""
-        self.index = faiss.IndexFlatIP(self.embedding_dim)  # Using Inner Product for cosine similarity
+        self.index = faiss.IndexFlatIP(self.embedding_dim)
 
     def process_pdfs(self):
-        """Main processing pipeline"""
         total_files = 0
         total_pages = 0
         total_chunks = 0
@@ -65,59 +70,72 @@ class FAISSIngestor:
 
                 try:
                     text_by_page = self.extract_text_from_pdf(pdf_path)
+                    file_page_count = len(text_by_page)
+                    file_chunk_count = 0
+
                     for page_num, text in text_by_page:
                         cleaned_text = self.clean_text(text)
                         chunks = self.split_text_into_chunks(cleaned_text)
 
                         if chunks:
-                            # Batch encode chunks
                             chunk_embeddings = self.embedding_model.encode(chunks)
 
-                            # Store metadata for each chunk
+                            # Calculate and store similarities
+                            chunk_similarities = self.calculate_similarity(chunk_embeddings)
+                            self.similarities.extend(chunk_similarities)
+
+                            all_embeddings.append(chunk_embeddings)
+
                             for i, chunk in enumerate(chunks):
                                 self.metadata.append({
                                     "file": file_name,
                                     "page": page_num,
                                     "chunk": chunk,
-                                    "chunk_idx": i
+                                    "similarity": float(chunk_similarities[i]) if i < len(chunk_similarities) else 0.0
                                 })
 
-                            all_embeddings.append(chunk_embeddings)
-                            total_chunks += len(chunks)
+                            file_chunk_count += len(chunks)
 
-                    total_pages += len(text_by_page)
-                    print(f"Processed {file_name} ({len(text_by_page)} pages, {len(chunks)} chunks)")
+                    file_end = time.time()
+                    file_time = file_end - file_start
+                    print(
+                        f" -----> Processed {file_name}: {file_page_count} pages, {file_chunk_count} chunks in {file_time:.2f} seconds")
+                    total_pages += file_page_count
+                    total_chunks += file_chunk_count
 
                 except Exception as e:
                     print(f"Error processing {file_name}: {str(e)}")
 
-        # Combine all embeddings and add to index
         if all_embeddings:
             all_embeddings = np.vstack(all_embeddings).astype('float32')
-
-            # Normalize embeddings before adding to index
             faiss.normalize_L2(all_embeddings)
             self.index.add(all_embeddings)
 
-            # Save index and metadata
             faiss.write_index(self.index, "faiss_index.index")
             with open("faiss_metadata.pkl", "wb") as f:
                 pickle.dump(self.metadata, f)
 
         mem_after = process.memory_info().rss / (1024 * 1024)
-        total_time = time.time() - start_time
+        ingestion_time = time.time() - start_time
+
+        # Calculate similarity statistics
+        avg_similarity = np.mean(self.similarities) if self.similarities else 0
+        max_similarity = np.max(self.similarities) if self.similarities else 0
+        min_similarity = np.min(self.similarities) if self.similarities else 0
 
         print("\n" + "=" * 50)
         print("INGESTION SUMMARY")
         print("=" * 50)
-        print(f"Total files processed: {total_files}")
-        print(f"Total pages processed: {total_pages}")
-        print(f"Total chunks generated: {total_chunks}")
-        print(f"Total ingestion time: {total_time:.2f} seconds")
-        print(f"Memory usage before: {mem_before:.2f} MB")
-        print(f"Memory usage after: {mem_after:.2f} MB")
-        print(f"FAISS index size: {self.index.ntotal if self.index else 0} vectors")
-        print("=" * 50)
+        print(f"Total files processed  : {total_files}")
+        print(f"Total pages processed  : {total_pages}")
+        print(f"Total chunks generated : {total_chunks}")
+        print(f"Total ingestion time   : {ingestion_time:.2f} seconds")
+        print(f"Memory usage before    : {mem_before:.2f} MB")
+        print(f"Memory usage after     : {mem_after:.2f} MB")
+        print(f"Average chunk similarity: {avg_similarity:.4f}")
+        print(f"Maximum chunk similarity: {max_similarity:.4f}")
+        print(f"Minimum chunk similarity: {min_similarity:.4f}")
+        print("=" * 50 + "\n")
 
 
 if __name__ == "__main__":

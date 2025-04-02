@@ -8,212 +8,150 @@ import time
 import psutil
 import re
 from sentence_transformers import SentenceTransformer
-
-# Initialize Redis connection
-redis_client = redis.Redis(host="localhost", port=6379, db=0)
-
-#VECTOR_DIM = 768
-VECTOR_DIM = 384
-INDEX_NAME = "embedding_index"
-DOC_PREFIX = "doc:"
-DISTANCE_METRIC = "COSINE"
+from sklearn.metrics.pairwise import cosine_similarity
 
 
-# Preprocessing function
-def clean_text(text, remove_punctuation=False, remove_whitespace=False):
-    if remove_punctuation:
-        text = re.sub(r'[^\w\s]', '', text)
-    if remove_whitespace:
-        text = ' '.join(text.split())
-    return text
+class RedisIngestor:
+    def __init__(self, data_dir="../data/"):
+        self.data_dir = data_dir
+        self.redis_client = redis.Redis(host="localhost", port=6379, db=0)
+        self.embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        self.similarities = []
+        self.VECTOR_DIM = 384
+        self.INDEX_NAME = "embedding_index"
+        self.DOC_PREFIX = "doc:"
 
-# used to clear the redis vector store
-def clear_redis_store():
-    print("Clearing existing Redis store...")
-    redis_client.flushdb()
-    print("Redis store cleared.")
+    def clean_text(self, text):
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
+    def extract_text_from_pdf(self, pdf_path):
+        doc = fitz.open(pdf_path)
+        text_by_page = []
+        for page_num, page in enumerate(doc):
+            text = page.get_text()
+            if text.strip():
+                text_by_page.append((page_num, text))
+        return text_by_page
 
-# Create an HNSW index in Redis
-def create_hnsw_index():
-    try:
-        redis_client.execute_command(f"FT.DROPINDEX {INDEX_NAME} DD")
-    except redis.exceptions.ResponseError:
-        pass
+    def split_text_into_chunks(self, text, chunk_size=500, overlap=150):
+        words = text.split()
+        chunks = []
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = " ".join(words[i: i + chunk_size])
+            chunks.append(chunk)
+        return chunks
 
-    redis_client.execute_command(
-        f"""
-        FT.CREATE {INDEX_NAME} ON HASH PREFIX 1 {DOC_PREFIX}
-        SCHEMA text TEXT
-        embedding VECTOR HNSW 6 DIM {VECTOR_DIM} TYPE FLOAT32 DISTANCE_METRIC {DISTANCE_METRIC}
-        """
-    )
-    print("Index created successfully.")
+    def calculate_similarity(self, embeddings):
+        if len(embeddings) < 2:
+            return []
+        sim_matrix = cosine_similarity(embeddings)
+        np.fill_diagonal(sim_matrix, 0)  # Ignore self-similarity
+        return sim_matrix.max(axis=1)  # Get max similarity for each chunk
 
+    def clear_redis_store(self):
+        print("Clearing existing Redis store...")
+        self.redis_client.flushdb()
+        print("Redis store cleared.")
 
-# Generate an embedding using nomic-embed-text
-def get_embedding(text: str, model: str = "nomic-embed-text") -> list:
+    def create_hnsw_index(self):
+        try:
+            self.redis_client.execute_command(f"FT.DROPINDEX {self.INDEX_NAME} DD")
+        except redis.exceptions.ResponseError:
+            pass
 
-    response = ollama.embeddings(model=model, prompt=text)
-    return response["embedding"]
+        self.redis_client.execute_command(
+            f"""
+            FT.CREATE {self.INDEX_NAME} ON HASH PREFIX 1 {self.DOC_PREFIX}
+            SCHEMA text TEXT
+            embedding VECTOR HNSW 6 DIM {self.VECTOR_DIM} TYPE FLOAT32 DISTANCE_METRIC COSINE
+            """
+        )
+        print("Index created successfully.")
 
-st_model_minilm = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-st_model_mpnet = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+    def store_embeddings(self, file_name, page_num, chunks):
+        if not chunks:
+            return
 
-# Generate an embedding for the given text using the MiniLM model
-def get_embedding_st_minilm(text: str) -> list:
-    embedding = st_model_minilm.encode(text)
-    return embedding.tolist()
+        embeddings = self.embedding_model.encode(chunks)
+        chunk_similarities = self.calculate_similarity(embeddings)
+        self.similarities.extend(chunk_similarities)
 
-# Generate an embedding for the given text using the MPNet model
-def get_embedding_st_mpnet(text: str) -> list:
-    embedding = st_model_mpnet.encode(text)
-    return embedding.tolist()
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            key = f"{self.DOC_PREFIX}:{file_name}_page_{page_num}_chunk_{i}"
+            self.redis_client.hset(
+                key,
+                mapping={
+                    "file": file_name,
+                    "page": str(page_num),
+                    "chunk": chunk,
+                    "embedding": np.array(embedding, dtype=np.float32).tobytes(),
+                    "similarity": str(chunk_similarities[i]) if i < len(chunk_similarities) else "0.0"
+                }
+            )
 
-# store the embedding in Redis
-def store_embedding(file: str, page: str, chunk: str, embedding: list):
-    
-    max_length = 50
-    shortened_chunk = (chunk[:max_length] + '...') if len(chunk) > max_length else chunk
+    def process_pdfs(self):
+        total_files = 0
+        total_pages = 0
+        total_chunks = 0
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / (1024 * 1024)
+        start_time = time.time()
 
-    key = f"{DOC_PREFIX}:{file}_page_{page}_chunk_{shortened_chunk}"
-    redis_client.hset(
-        key,
-        mapping={
-            "file": file,
-            "page": page,
-            "chunk": chunk,
-            "embedding": np.array(
-                embedding, dtype=np.float32
-            ).tobytes(),  # Store as byte array
-        },
-    )
-    print(f"Stored embedding for: {shortened_chunk}")
+        self.clear_redis_store()
+        self.create_hnsw_index()
 
+        for file_name in os.listdir(self.data_dir):
+            if file_name.endswith(".pdf"):
+                total_files += 1
+                file_start = time.time()
+                pdf_path = os.path.join(self.data_dir, file_name)
 
-# extract the text from a PDF by page
-def extract_text_from_pdf(pdf_path):
-    """Extract text from a PDF file."""
-    doc = fitz.open(pdf_path)
-    text_by_page = []
-    for page_num, page in enumerate(doc):
-        text_by_page.append((page_num, page.get_text()))
-    return text_by_page
+                try:
+                    text_by_page = self.extract_text_from_pdf(pdf_path)
+                    file_page_count = len(text_by_page)
+                    file_chunk_count = 0
 
+                    for page_num, text in text_by_page:
+                        cleaned_text = self.clean_text(text)
+                        chunks = self.split_text_into_chunks(cleaned_text)
+                        if chunks:
+                            self.store_embeddings(file_name, page_num, chunks)
+                            file_chunk_count += len(chunks)
 
-# split the text into chunks with overlap
-def split_text_into_chunks(text, chunk_size=500, overlap=150):
-    """Split text into chunks of approximately chunk_size words with overlap."""
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i : i + chunk_size])
-        chunks.append(chunk)
-    return chunks
+                    file_end = time.time()
+                    file_time = file_end - file_start
+                    print(
+                        f" -----> Processed {file_name}: {file_page_count} pages, {file_chunk_count} chunks in {file_time:.2f} seconds")
+                    total_pages += file_page_count
+                    total_chunks += file_chunk_count
 
+                except Exception as e:
+                    print(f"Error processing {file_name}: {str(e)}")
 
-# Process all PDF files in a given directory
-def process_pdfs(data_dir):
+        mem_after = process.memory_info().rss / (1024 * 1024)
+        ingestion_time = time.time() - start_time
 
-    total_files = 0
-    total_pages = 0
-    total_chunks = 0
+        # Calculate similarity statistics
+        avg_similarity = np.mean(self.similarities) if self.similarities else 0
+        max_similarity = np.max(self.similarities) if self.similarities else 0
+        min_similarity = np.min(self.similarities) if self.similarities else 0
 
-    for file_name in os.listdir(data_dir):
-        if file_name.endswith(".pdf"):
-            total_files += 1
-            file_start = time.time()
-
-            pdf_path = os.path.join(data_dir, file_name)
-            text_by_page = extract_text_from_pdf(pdf_path)
-            file_page_count = len(text_by_page)
-            file_chunk_count = 0
-
-            for page_num, text in text_by_page:
-                cleaned_text = clean_text(text, remove_punctuation=False, remove_whitespace=False)
-                chunks = split_text_into_chunks(cleaned_text)
-                file_chunk_count += len(chunks)
-                for chunk_index, chunk in enumerate(chunks):
-                    #embedding = get_embedding(chunk)
-                    embedding = get_embedding_st_minilm(chunk)
-                    #embedding = get_embedding_st_mpnet(chunk)
-                    store_embedding(
-                        file=file_name,
-                        page=str(page_num),
-                        # chunk=str(chunk_index),
-                        chunk=str(chunk),
-                        embedding=embedding,
-                    )
-            file_end = time.time()
-            file_time = file_end - file_start
-
-            print(f" -----> Processed {file_name}: {file_page_count} pages, {file_chunk_count} chunks in {file_time:.2f} seconds")
-            total_pages += file_page_count
-            total_chunks += file_chunk_count
-
-    return total_files, total_pages, total_chunks
-
-def query_redis(query_text: str):
-    q = (
-        Query("*=>[KNN 5 @embedding $vec AS vector_distance]")
-        .sort_by("vector_distance")
-        .return_fields("id", "vector_distance")
-        .dialect(2)
-    )
-    query_text = "Efficient search in vector databases"
-    #embedding = get_embedding(query_text)
-    embedding = get_embedding_st_minilm(query_text)
-    #embedding = get_embedding_st_mpnet(query_text)
-
-    query_start = time.time()
-    res = redis_client.ft(INDEX_NAME).search(
-        q, query_params={"vec": np.array(embedding, dtype=np.float32).tobytes()}
-    )
-    query_end = time.time()
-    query_time = query_end - query_start
-
-    similarities = []
-    print("\n" + "=" * 50)
-    print("QUERY SUMMARY")
-    print("=" * 50)
-    print(f"Query: {query_text}")
-    print(f"Query execution time: {query_time:.2f} seconds")
-    print("Results:")
-    for doc in res.docs:
-        print(f"Document ID: {doc.id} | Similarity: {doc.vector_distance}")
-    print("=" * 50 + "\n")
-
-
-def main():
-    clear_redis_store()
-    create_hnsw_index()
-
-    # Log memory before ingestion
-    process_obj = psutil.Process(os.getpid())
-    mem_before = process_obj.memory_info().rss / (1024 * 1024)
-
-    ingestion_start = time.time()
-    total_files, total_pages, total_chunks = process_pdfs("../data/")
-    print("\n---Done processing PDFs---\n")
-    ingestion_end = time.time()
-    ingestion_time = ingestion_end - ingestion_start
-
-    # Log memory after ingestion
-    mem_after = process_obj.memory_info().rss / (1024 * 1024)
-
-    print("\n" + "=" * 50)
-    print("INGESTION SUMMARY")
-    print("=" * 50)
-    print(f"Total files processed  : {total_files}")
-    print(f"Total pages processed  : {total_pages}")
-    print(f"Total chunks generated : {total_chunks}")
-    print(f"Total ingestion time   : {ingestion_time:.2f} seconds")
-    print(f"Memory usage before    : {mem_before:.2f} MB")
-    print(f"Memory usage after     : {mem_after:.2f} MB")
-    print("=" * 50 + "\n")
-
-    query_redis("What is the capital of France?")
+        print("\n" + "=" * 50)
+        print("INGESTION SUMMARY")
+        print("=" * 50)
+        print(f"Total files processed  : {total_files}")
+        print(f"Total pages processed  : {total_pages}")
+        print(f"Total chunks generated : {total_chunks}")
+        print(f"Total ingestion time   : {ingestion_time:.2f} seconds")
+        print(f"Memory usage before    : {mem_before:.2f} MB")
+        print(f"Memory usage after     : {mem_after:.2f} MB")
+        print(f"Average chunk similarity: {avg_similarity:.4f}")
+        print(f"Maximum chunk similarity: {max_similarity:.4f}")
+        print(f"Minimum chunk similarity: {min_similarity:.4f}")
+        print("=" * 50 + "\n")
 
 
 if __name__ == "__main__":
-    main()
+    ingestor = RedisIngestor()
+    ingestor.process_pdfs()
